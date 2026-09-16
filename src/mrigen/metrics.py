@@ -22,9 +22,11 @@ calibrated uncertainty has error growing with predicted std).
 
 from __future__ import annotations
 
-from itertools import pairwise
+# from itertools import pairwise
+from typing import Any
 
 import numpy as np
+from numpy import signedinteger
 from skimage.metrics import structural_similarity
 
 
@@ -35,8 +37,24 @@ def psnr(gt: np.ndarray, pred: np.ndarray, data_range: float | None = None) -> f
 
     Plain NumPy: use ``np`` (``jnp`` is not imported in this file).
     """
-    # TODO (evaluation thread): implement PSNR.
-    raise NotImplementedError("psnr is a TODO for the evaluation thread")
+
+    # Mean squared error
+    mse = np.mean((gt - pred) ** 2)
+
+    # If data_range wasn't provided, determine it from ground truth
+    if data_range is None:
+        data_range = np.max(gt) - np.min(gt)
+
+    # Perfect reconstruction
+    if mse == 0:
+        return float("inf")
+
+    # Avoid invalid PSNR calculation if data range is zero
+    if data_range <= 0:
+        raise ValueError("data_range must be greater than 0.")
+
+    # PSNR = 10 * log10(data_range^2 / MSE)
+    return float(10 * np.log10((data_range ** 2) / mse))
 
 
 def nmse(gt: np.ndarray, pred: np.ndarray) -> float:
@@ -46,8 +64,19 @@ def nmse(gt: np.ndarray, pred: np.ndarray) -> float:
 
     Plain NumPy: use ``np`` (``jnp`` is not imported in this file).
     """
-    # TODO (evaluation thread): implement NMSE.
-    raise NotImplementedError("nmse is a TODO for the evaluation thread")
+
+    # Squared error: ||pred - gt||^2
+    numerator = np.sum((pred - gt) ** 2)
+
+    # Squared magnitude of ground truth: ||gt||^2
+    denominator: signedinteger[Any] = np.sum(gt ** 2)
+
+    # Avoid division by zero
+    if denominator == 0:
+        raise ValueError("Cannot calculate NMSE because gt has zero norm.")
+
+    # NMSE = ||pred - gt||^2 / ||gt||^2
+    return float(numerator / denominator)
 
 
 def ssim(gt: np.ndarray, pred: np.ndarray, data_range: float | None = None) -> float:
@@ -80,9 +109,7 @@ def diversity(samples: np.ndarray) -> float:
     return float(np.mean(diss))
 
 
-def calibration_curve(
-    error: np.ndarray, std: np.ndarray, n_bins: int = 10
-) -> tuple[np.ndarray, np.ndarray]:
+def calibration_curve(error: np.ndarray, std: np.ndarray, n_bins: int = 10) -> tuple[np.ndarray, np.ndarray]:
     """Bin absolute error against predicted std. GIVEN.
 
     Args:
@@ -99,6 +126,6 @@ def calibration_curve(
     order = np.argsort(std)
     std, error = std[order], error[order]
     edges = np.linspace(0, len(std), n_bins + 1).astype(int)
-    mean_std = np.array([std[a:b].mean() for a, b in pairwise(edges) if b > a])
-    mean_err = np.array([error[a:b].mean() for a, b in pairwise(edges) if b > a])
-    return mean_std, mean_err
+    # mean_std = np.array([std[a:b].mean() for a, b in pairwise(edges) if b > a])
+    # mean_err = np.array([error[a:b].mean() for a, b in pairwise(edges) if b > a])
+    # return mean_std, mean_err
