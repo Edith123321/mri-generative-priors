@@ -1,4 +1,4 @@
-"""Model-agnostic evaluation: one protocol for every reconstruction method. GIVEN.
+"""Model-agnostic evaluation: one protocol for every reconstruction method.
 
 Comparisons are only fair if every method sees the *same* problem. This module
 fixes the problem and lets the method vary. A **reconstructor** is any callable
@@ -7,11 +7,9 @@ fixes the problem and lets the method vary. A **reconstructor** is any callable
 
 where :class:`Recon` carries ``mean`` (H, W) and, if the method has them,
 ``std`` (H, W) and ``samples`` (N, H, W). Adapters for the repo's own methods
-are below; a new model -- a diffusion prior, a power-spectrum prior, a classical
-solver, anything -- joins the comparison with an adapter of the same shape.
+are below; a new model joins the comparison with an adapter of the same shape.
 
-The protocol (what :func:`evaluate` standardises, and what your table must state
--- the held-out slices are yours to supply; it cannot check where an array came from):
+The protocol (:func:`evaluate` standardises it; your table must state it):
 
 * **held-out slices only** -- ``FastMRISlices(root, split="test")``, never
   slices the prior was trained on;
@@ -43,6 +41,7 @@ import numpy as np
 from mrigen import metrics
 from mrigen.fourier import fft2c
 from mrigen.recon.classical import tv_fista, zero_filled
+from mrigen.recon.operators import data_consistency
 from mrigen.recon.spectrum import wiener_reconstruct
 from mrigen.recon.vae_numpyro import reconstruct_map, reconstruct_posterior
 
@@ -59,16 +58,18 @@ class Recon:
 
 
 def measure(x, mask, sigma: float, key) -> jnp.ndarray:
-    """Simulate the measurement ``y = M * (fft2c(x) + noise)`` (CLAUDE.md Contract 3).
+    """Simulate ``y = M * (fft2c(x) + noise)``.
 
-    Noise is complex Gaussian with std ``sigma`` per real/imag component, drawn from
-    ``key`` -- so the same ``key`` gives every method the same measurement.
+    Noise is complex Gaussian with std ``sigma`` per real/imag component, drawn
+    from ``key`` -- so the same ``key`` gives every method the same measurement.
     """
     if sigma < 0:
         raise ValueError(f"sigma must be non-negative, got {sigma}")
     x = jnp.asarray(x)
     k1, k2 = jax.random.split(key)
-    noise = sigma * (jax.random.normal(k1, x.shape) + 1j * jax.random.normal(k2, x.shape))
+    noise = sigma * (
+        jax.random.normal(k1, x.shape) + 1j * jax.random.normal(k2, x.shape)
+    )
     return jnp.asarray(mask) * (fft2c(x) + noise)
 
 
@@ -82,23 +83,30 @@ def zero_filled_recon(y_obs, mask, sigma) -> Recon:
 
 
 def tv_recon(lam: float = 1e-2, n_iter: int = 50):
-    """Classical compressed sensing (FISTA with an L1 sparsity proxy; see classical.py)."""
+    """Classical compressed sensing (FISTA with a TV/L1 sparsity proxy)."""
 
     def recon(y_obs, mask, sigma) -> Recon:
-        return Recon(mean=np.asarray(tv_fista(y_obs, mask, lam=lam, n_iter=n_iter)))
+        return Recon(
+            mean=np.asarray(tv_fista(y_obs, mask, lam=lam, n_iter=n_iter))
+        )
 
     return recon
 
 
 def wiener_recon(P, n_samples: int = 0, seed: int = 0):
-    """Power-spectrum prior with its closed-form posterior (recon/spectrum.py)."""
+    """Power-spectrum prior with its closed-form posterior."""
 
     def recon(y_obs, mask, sigma) -> Recon:
         out = wiener_reconstruct(
-            y_obs, mask, P, sigma, n_samples=n_samples, key=jax.random.PRNGKey(seed)
+            y_obs, mask, P, sigma,
+            n_samples=n_samples, key=jax.random.PRNGKey(seed),
         )
         samples = None if out["samples"] is None else np.asarray(out["samples"])
-        return Recon(mean=np.asarray(out["mean"]), std=np.asarray(out["std"]), samples=samples)
+        return Recon(
+            mean=np.asarray(out["mean"]),
+            std=np.asarray(out["std"]),
+            samples=samples,
+        )
 
     return recon
 
@@ -106,35 +114,62 @@ def wiener_recon(P, n_samples: int = 0, seed: int = 0):
 def map_recon(decoder, latent_dim, steps: int = 1000, lr: float = 1e-2, seed: int = 0):
     """MAP through *any* decoder -- a VAE module or a pure ``decode(z)`` function.
 
-    ``latent_dim`` may be an int (VAE) or a shape tuple (e.g. ``(2, H, W)`` for the
-    power-spectrum decoder). Returns no uncertainty: MAP is a point estimate.
+    ``latent_dim`` may be an int (VAE) or a shape tuple (e.g. ``(2, H, W)`` for
+    the power-spectrum decoder). Returns no uncertainty: MAP is a point estimate.
     """
 
     def recon(y_obs, mask, sigma) -> Recon:
         x_map, _ = reconstruct_map(
-            y_obs, mask, decoder, latent_dim, sigma=sigma, steps=steps, lr=lr, seed=seed
+            y_obs, mask, decoder, latent_dim,
+            sigma=sigma, steps=steps, lr=lr, seed=seed,
         )
         return Recon(mean=np.asarray(x_map))
 
     return recon
 
 
+def map_dc_recon(decoder, latent_dim, steps: int = 1000, lr: float = 1e-2, seed: int = 0):
+    """MAP, then one data-consistency projection.
+
+    Pure MAP can only ever return an image the decoder can draw, so wherever the
+    prior is too smooth to represent the anatomy, the reconstruction is wrong
+    *even at the frequencies the scanner actually measured*. The DC projection
+    puts the measured k-space back: the decoder supplies only the lines that
+    were never acquired. It costs nothing on top of MAP and is the honest way to
+    use a weak prior -- but note it also hands most of the low frequencies back
+    to the data, so the gap to zero-filled narrows. Report both rows.
+    """
+
+    def recon(y_obs, mask, sigma) -> Recon:
+        x_map, _ = reconstruct_map(
+            y_obs, mask, decoder, latent_dim,
+            sigma=sigma, steps=steps, lr=lr, seed=seed,
+        )
+        return Recon(mean=np.asarray(data_consistency(x_map, y_obs, mask)))
+
+    return recon
+
+
 def posterior_recon(
-    decoder, latent_dim, num_samples: int = 200, num_warmup: int = 200, seed: int = 0,
+    decoder,
+    latent_dim,
+    num_samples: int = 200,
+    num_warmup: int = 200,
+    seed: int = 0,
     max_tree_depth: int = 10,
 ):
     """NUTS posterior through a decoder: mean, per-pixel std, and the samples.
 
-    NUTS is the expensive method: up to ``2**max_tree_depth - 1`` decoder evaluations
-    per sample. On a CPU, use few samples and ``max_tree_depth`` 6-7; on the GPU
-    server, the defaults.
+    NUTS is the expensive method: up to ``2**max_tree_depth - 1`` decoder
+    evaluations per sample. On a CPU, use few samples and ``max_tree_depth``
+    6-7; on the GPU server, the defaults.
     """
 
     def recon(y_obs, mask, sigma) -> Recon:
         out = reconstruct_posterior(
             y_obs, mask, decoder, latent_dim, sigma=sigma,
-            num_samples=num_samples, num_warmup=num_warmup, seed=seed,
-            max_tree_depth=max_tree_depth,
+            num_samples=num_samples, num_warmup=num_warmup,
+            seed=seed, max_tree_depth=max_tree_depth,
         )
         return Recon(
             mean=np.asarray(out["mean"]),
@@ -153,8 +188,8 @@ class Results:
     """Output of :func:`evaluate`.
 
     ``rows``: one dict per (method, slice, R) with the metrics.
-    ``pooled``: method -> (|error| pixels, std pixels) over every evaluated slice,
-    for calibration; only methods that return ``std`` appear.
+    ``pooled``: method -> (|error| pixels, std pixels) over every evaluated
+    slice, for calibration; only methods that return ``std`` appear.
     ``worst``: method -> the lowest-PSNR case (ground truth, recon, std, R, slice).
     """
 
@@ -212,9 +247,13 @@ def evaluate(
         from mrigen.masks import equispaced_mask
 
         mask_fn = equispaced_mask
+
     images = np.asarray(images, dtype=np.float32)
     if images.ndim != 3 or len(images) == 0:
-        raise ValueError(f"images must be a non-empty (N, H, W) stack, got shape {images.shape}")
+        raise ValueError(
+            f"images must be a non-empty (N, H, W) stack, got shape {images.shape}"
+        )
+
     res = Results()
     warmed = set()
     for i, x in enumerate(images):
@@ -224,15 +263,18 @@ def evaluate(
             r_eff = float(mask.size / mask.sum())
             key = jax.random.PRNGKey(seed * 100_003 + i * 1_009 + int(R))
             y = measure(x, mask, sigma, key)
+
             for name, fn in methods.items():
                 if warmup and name not in warmed:
                     _block(fn(y, mask, sigma).mean)
                     warmed.add(name)
+
                 t0 = time.perf_counter()
                 out = fn(y, mask, sigma)
                 _block(out.mean)
                 seconds = time.perf_counter() - t0
                 mean = np.asarray(out.mean, dtype=np.float32)
+
                 row = {
                     "method": name,
                     "slice": label,
@@ -245,22 +287,30 @@ def evaluate(
                     "has_std": out.std is not None,
                 }
                 res.rows.append(row)
+
                 if out.std is not None:
                     errs, stds = res.pooled[name]
                     errs.append(np.abs(mean - x).ravel())
                     stds.append(np.asarray(out.std, dtype=np.float32).ravel())
+
                 w = res.worst.get(name)
                 if w is None or row["psnr"] < w["psnr"]:
                     res.worst[name] = {
-                        "psnr": row["psnr"], "R": int(R), "slice": label, "gt": x, "mean": mean,
+                        "psnr": row["psnr"],
+                        "R": int(R),
+                        "slice": label,
+                        "gt": x,
+                        "mean": mean,
                         "std": None if out.std is None else np.asarray(out.std),
                     }
+
             if verbose:
                 done = [r for r in res.rows if r["slice"] == label and r["R"] == R]
                 print(
                     f"slice {label:>14}  R={R} (eff {r_eff:.1f})  "
                     + "  ".join(
-                        f"{r['method']} {r['psnr']:.1f} dB ({r['seconds']:.0f}s)" for r in done
+                        f"{r['method']} {r['psnr']:.1f} dB ({r['seconds']:.0f}s)"
+                        for r in done
                     )
                 )
     return res
@@ -274,10 +324,15 @@ def summarise(rows, metric_names=("psnr", "ssim", "nmse", "seconds")) -> dict:
     groups = defaultdict(list)
     for r in rows:
         groups[(r["method"], r["R"])].append(r)
+
     out = {}
     for key, rs in groups.items():
         out[key] = {
-            m: (float(np.mean([r[m] for r in rs])), float(np.std([r[m] for r in rs])), len(rs))
+            m: (
+                float(np.mean([r[m] for r in rs])),
+                float(np.std([r[m] for r in rs])),
+                len(rs),
+            )
             for m in metric_names
         }
         out[key]["R_eff"] = float(np.mean([r["R_eff"] for r in rs]))
@@ -289,8 +344,14 @@ def table(rows, metric: str = "psnr", fmt: str = "{:.2f}") -> str:
     s = summarise(rows)
     methods = list(dict.fromkeys(r["method"] for r in rows))
     accs = sorted({r["R"] for r in rows})
-    r_eff = {R: np.mean([v["R_eff"] for k, v in s.items() if k[1] == R]) for R in accs}
-    head = f"| {metric} | " + " | ".join(f"R = {R} (eff {r_eff[R]:.1f})" for R in accs) + " |"
+    r_eff = {
+        R: np.mean([v["R_eff"] for k, v in s.items() if k[1] == R]) for R in accs
+    }
+    head = (
+        f"| {metric} | "
+        + " | ".join(f"R = {R} (eff {r_eff[R]:.1f})" for R in accs)
+        + " |"
+    )
     lines = [head, "|---|" + "---|" * len(accs)]
     for m in methods:
         cells = []
@@ -299,7 +360,9 @@ def table(rows, metric: str = "psnr", fmt: str = "{:.2f}") -> str:
             if v is None:
                 cells.append("—")
             else:
-                cells.append(f"{fmt.format(v[metric][0])} ± {fmt.format(v[metric][1])}")
+                cells.append(
+                    f"{fmt.format(v[metric][0])} ± {fmt.format(v[metric][1])}"
+                )
         lines.append(f"| {m} | " + " | ".join(cells) + " |")
     n = max(v[metric][2] for v in s.values())
     lines.append(f"\n(mean ± std over {n} held-out slice(s))")
@@ -314,11 +377,13 @@ def plot_metric_vs_R(rows, metric: str = "psnr", ax=None):
     s = summarise(rows)
     methods = list(dict.fromkeys(r["method"] for r in rows))
     accs = sorted({r["R"] for r in rows})
+
     for m in methods:
         present = [R for R in accs if (m, R) in s]
         mu = [s[(m, R)][metric][0] for R in present]
         sd = [s[(m, R)][metric][1] for R in present]
         ax.errorbar(present, mu, yerr=sd, marker="o", capsize=3, label=m)
+
     ax.set_xlabel("acceleration R (nominal)")
     ax.set_ylabel(metric)
     ax.set_xticks(accs)
@@ -327,19 +392,23 @@ def plot_metric_vs_R(rows, metric: str = "psnr", ax=None):
 
 
 def calibration(results: Results, method: str, n_bins: int = 10):
-    """Pooled calibration curve for one method: ``(mean_std_per_bin, mean_err_per_bin)``."""
+    """Pooled calibration curve: ``(mean_std_per_bin, mean_err_per_bin)``."""
     errs, stds = results.pooled[method]
     if not errs:
-        raise ValueError(f"{method!r} returned no std, so it has no calibration curve")
-    return metrics.calibration_curve(np.concatenate(errs), np.concatenate(stds), n_bins=n_bins)
+        raise ValueError(
+            f"{method!r} returned no std, so it has no calibration curve"
+        )
+    return metrics.calibration_curve(
+        np.concatenate(errs), np.concatenate(stds), n_bins=n_bins
+    )
 
 
 def plot_calibration(results: Results, methods=None, n_bins: int = 10, ax=None):
     """Calibration curves for every method with a std, against the Gaussian reference.
 
-    For a calibrated zero-mean Gaussian error the mean **absolute** error in a bin is
-    ``sqrt(2/pi) ~ 0.8`` of the predicted std, so the reference line has that slope,
-    not 1.
+    For a calibrated zero-mean Gaussian error the mean **absolute** error in a
+    bin is ``sqrt(2/pi) ~ 0.8`` of the predicted std, so the reference line has
+    that slope, not 1.
     """
     import matplotlib.pyplot as plt
 
@@ -350,6 +419,7 @@ def plot_calibration(results: Results, methods=None, n_bins: int = 10, ax=None):
         s, e = calibration(results, m, n_bins)
         ax.plot(s, e, "o-", label=m)
         hi = max(hi, float(s.max()), float(e.max()))
+
     k = float(np.sqrt(2.0 / np.pi))
     ax.plot([0, hi], [0, k * hi], "k:", lw=1, label="perfect (√(2/π) · std)")
     ax.set_xlabel("predicted std (bin mean)")
@@ -364,5 +434,7 @@ def worst_case(results: Results, method: str):
 
     w = results.worst[method]
     fig = viz.panel(w["gt"], w["mean"], std=w["std"])
-    fig.suptitle(f"{method}: worst case, slice {w['slice']}, R = {w['R']}, {w['psnr']:.1f} dB")
+    fig.suptitle(
+        f"{method}: worst case, slice {w['slice']}, R = {w['R']}, {w['psnr']:.1f} dB"
+    )
     return fig

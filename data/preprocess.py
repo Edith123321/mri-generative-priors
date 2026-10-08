@@ -60,19 +60,38 @@ def preprocess(size: int = 128) -> None:
         )
     OUT_DIR.mkdir(parents=True, exist_ok=True)
 
+    skipped = []
     for vol in vols:
-        with h5py.File(vol, "r") as f:
-            if SOURCE_KEY not in f:
-                print(f"skip {vol.name}: no '{SOURCE_KEY}' dataset")
-                continue
-            esc = f[SOURCE_KEY][()]  # (n_slices, 320, 320) float32 magnitude
+        try:
+            with h5py.File(vol, "r") as f:
+                if SOURCE_KEY not in f:
+                    print(f"skip {vol.name}: no '{SOURCE_KEY}' dataset")
+                    skipped.append((vol.name, f"no '{SOURCE_KEY}' dataset"))
+                    continue
+                esc = f[SOURCE_KEY][()]  # (n_slices, 320, 320) float32 magnitude
+        except OSError as exc:
+            # A truncated download is the usual cause: the fastMRI links are
+            # time-limited, so a stream that dies part-way leaves a file that
+            # looks fine in `ls` but cannot be opened. Skip it and keep going
+            # rather than losing the whole run -- but do say so at the end,
+            # because a silently missing volume is a silently smaller training
+            # set, and that shows up later as a worse prior.
+            print(f"skip {vol.name}: cannot read ({exc.__class__.__name__}) -- "
+                  f"likely a truncated download; re-download this volume")
+            skipped.append((vol.name, "unreadable/truncated"))
+            continue
         slices = _to_slices(esc, size)
         out = OUT_DIR / f"{vol.stem}.npz"
         np.savez_compressed(out, slices=slices)
         print(f"{vol.name}: {slices.shape[0]} slices -> {out}")
 
-    total = sum(np.load(p)["slices"].shape[0] for p in OUT_DIR.glob("*.npz"))
-    print(f"done: {total} slices in {OUT_DIR}")
+    shards = sorted(OUT_DIR.glob("*.npz"))
+    total = sum(np.load(p)["slices"].shape[0] for p in shards)
+    print(f"done: {total} slices from {len(shards)} volume(s) in {OUT_DIR}")
+    if skipped:
+        print(f"WARNING: skipped {len(skipped)} of {len(vols)} raw volume(s):")
+        for name, why in skipped:
+            print(f"  - {name}: {why}")
 
 
 def main():
