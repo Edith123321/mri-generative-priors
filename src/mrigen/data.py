@@ -1,18 +1,16 @@
 """Dataset and loading for preprocessed magnitude slices.
 
-GIVEN. Reads the ``.npz`` shards written by ``data/preprocess.py`` and yields
-batches of 128x128 magnitude slices, per-slice normalised to [0, 1]. No
-patient data ships with the repo; this only touches files the student created
-locally from their own fastMRI download (see data/REGISTER_FIRST.md).
+Reads the ``.npz`` shards written by ``data/preprocess.py`` and yields batches
+of 128x128 magnitude slices, per-slice normalised to [0, 1]. No patient data
+ships with the repo; this only touches files created locally from your own
+fastMRI download (see data/REGISTER_FIRST.md).
 
 **Held-out split.** A prior must be evaluated on slices it never saw. Volumes
 named in :data:`HELDOUT_VOLUMES` are the *test* split; everything else is
-*train*. (Deliberately no third validation split for a one-week school; if you
-tune hyperparameters hard, know you are tuning on the training volumes.) The
-pre-trained checkpoint was trained with ``split="train"`` (see
-CHECKPOINTS.md), so ``FastMRISlices(root, split="test")`` gives you slices that
-are held out from the checkpoint too. Train on "train", tune on "train",
-report numbers on "test" -- and say so in your table.
+*train*. The pre-trained checkpoint was trained with ``split="train"`` (see
+CHECKPOINTS.md), so ``FastMRISlices(root, split="test")`` gives you slices held
+out from the checkpoint too. Train on "train", tune on "train", report numbers
+on "test" -- and say so in your table.
 """
 
 from __future__ import annotations
@@ -25,11 +23,11 @@ import numpy as np
 def normalise(x: np.ndarray) -> tuple[np.ndarray, float]:
     """Scale a magnitude image to [0, 1] by its max; return ``(x_norm, scale)``.
 
-    GIVEN. Per CLAUDE.md Contract 2, normalisation must be applied *identically*
-    at training and reconstruction time, so we **return the scale** rather than
-    discarding it: keep it next to the measurement and use ``denormalise`` to map
-    a reconstruction back to the original intensity range. A non-positive max
-    (e.g. an all-zero slice) falls back to scale 1.0 so the round-trip is safe.
+    Normalisation must be applied *identically* at training and reconstruction
+    time, so we **return the scale** rather than discarding it: keep it next to
+    the measurement and use :func:`denormalise` to map a reconstruction back to
+    the original intensity range. A non-positive max (e.g. an all-zero slice)
+    falls back to scale 1.0 so the round-trip is safe.
     """
     x = np.asarray(x, dtype=np.float32)
     scale = float(x.max())
@@ -39,13 +37,13 @@ def normalise(x: np.ndarray) -> tuple[np.ndarray, float]:
 
 
 def denormalise(x_norm: np.ndarray, scale: float) -> np.ndarray:
-    """Invert :func:`normalise`: map a [0, 1] image back by ``scale``. GIVEN."""
+    """Invert :func:`normalise`: map a [0, 1] image back by ``scale``."""
     return np.asarray(x_norm, dtype=np.float32) * np.float32(scale)
 
 
 #: Volumes reserved for evaluation. The first volumes in the fastMRI archive, so
-#: every download (``pixi run download --n 2`` or more) contains them. The mentor's
-#: checkpoint excludes them; never train on them.
+#: every download (``pixi run download --n 2`` or more) contains them. The
+#: mentor's checkpoint excludes them; never train on them.
 HELDOUT_VOLUMES: tuple[str, ...] = ("file1000593", "file1002067")
 
 
@@ -54,7 +52,7 @@ class FastMRISlices:
 
     Args:
         root: directory containing ``*.npz`` shards, each with key ``slices``
-            of shape (n, H, W).
+            of shape ``(n, H, W)``.
         normalize: if True, scale each slice to [0, 1] by its own max.
         split: ``None`` (every shard), ``"train"`` (shards not in ``heldout``)
             or ``"test"`` (shards in ``heldout``).
@@ -75,6 +73,7 @@ class FastMRISlices:
                 f"No .npz shards in {root}. Run `pixi run download` then "
                 f"`pixi run preprocess` first (see data/REGISTER_FIRST.md)."
             )
+
         available = [s.stem for s in shards]
         if split == "train":
             shards = [s for s in shards if s.stem not in heldout]
@@ -84,21 +83,24 @@ class FastMRISlices:
             raise ValueError(f"split must be None, 'train' or 'test', got {split!r}")
         if not shards:
             raise FileNotFoundError(
-                f"No volumes for split={split!r}. Held-out volumes are {list(heldout)}; "
-                f"you have {available}. Download more volumes (`pixi run download --n 4`) "
-                f"or pass `heldout=` explicitly."
+                f"No volumes for split={split!r}. Held-out volumes are "
+                f"{list(heldout)}; you have {available}. Download more volumes "
+                f"(`pixi run download --n 4`) or pass `heldout=` explicitly."
             )
+
         self.split = split
         self.volumes = [s.stem for s in shards]
+
         arrays = [np.load(s)["slices"] for s in shards]
         # which volume each slice came from (index into self.volumes), for reporting
         self.volume_index = np.concatenate(
             [np.full(len(a), i, dtype=np.int32) for i, a in enumerate(arrays)]
         )
         self.slices = np.concatenate(arrays, axis=0).astype(np.float32)
+
         # Per-slice scales kept so a reconstruction can be mapped back to the
-        # original intensity range (CLAUDE.md Contract 2). Scale is 1.0 when not
-        # normalising, so denormalise is always a valid inverse.
+        # original intensity range. Scale is 1.0 when not normalising, so
+        # ``denormalise`` is always a valid inverse.
         self.scales = np.ones(len(self.slices), dtype=np.float32)
         if normalize:
             for i in range(len(self.slices)):
@@ -111,14 +113,71 @@ class FastMRISlices:
         return self.slices[i]
 
 
-def data_loader(dataset, batch_size: int, *, shuffle: bool = True, seed: int = 0):
-    """Yield batches of shape (batch_size, H, W) for one epoch.
+def augment(x: np.ndarray, rng: np.random.Generator) -> np.ndarray:
+    """Randomly transform one magnitude slice, staying inside ``[0, 1]``.
 
-    Drops the last partial batch so shapes stay static for JIT.
+    With a few hundred slices the decoder can simply memorise the training set,
+    so we show it a slightly different view each epoch. Every transform here is
+    one a real scan could plausibly have produced:
+
+    * left-right flip -- the other knee;
+    * small rotation and shift -- the patient lying a little differently;
+    * small zoom -- a slightly different field of view;
+    * mild gamma -- a different contrast setting.
+
+    Deliberately *not* included: vertical flips (no knee is upside down) and
+    anything that would move intensities outside [0, 1], which would break
+    Contract 2 and the decoder's non-negative output.
+    """
+    from skimage.transform import SimilarityTransform, warp
+
+    if rng.random() < 0.5:
+        x = x[:, ::-1]
+
+    # One affine warp for rotation + zoom + shift, about the image centre.
+    h, w = x.shape
+    centre = np.array([w / 2.0, h / 2.0])
+    tf = (
+        SimilarityTransform(translation=-centre)
+        + SimilarityTransform(
+            rotation=np.deg2rad(rng.uniform(-7.0, 7.0)),
+            scale=rng.uniform(0.92, 1.08),
+        )
+        + SimilarityTransform(translation=centre + rng.uniform(-6.0, 6.0, size=2))
+    )
+    x = warp(
+        np.ascontiguousarray(x, dtype=np.float32),
+        tf.inverse,
+        order=1,
+        mode="constant",
+        cval=0.0,
+        preserve_range=True,
+    )
+
+    x = np.power(np.clip(x, 0.0, 1.0), rng.uniform(0.85, 1.15))
+    return np.clip(x, 0.0, 1.0).astype(np.float32)
+
+
+def data_loader(
+    dataset,
+    batch_size: int,
+    *,
+    shuffle: bool = True,
+    seed: int = 0,
+    augment_data: bool = False,
+):
+    """Yield batches of shape ``(batch_size, H, W)`` for one epoch.
+
+    Drops the last partial batch so shapes stay static for JIT. With
+    ``augment_data=True`` each slice is passed through :func:`augment` first --
+    use it for training, never for evaluation.
     """
     rng = np.random.default_rng(seed)
     n = len(dataset)
     idx = rng.permutation(n) if shuffle else np.arange(n)
     for start in range(0, n - batch_size + 1, batch_size):
         batch = idx[start : start + batch_size]
-        yield np.stack([dataset[i] for i in batch], axis=0)
+        imgs = [dataset[i] for i in batch]
+        if augment_data:
+            imgs = [augment(img, rng) for img in imgs]
+        yield np.stack(imgs, axis=0)
