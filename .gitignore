@@ -2,6 +2,13 @@
 data/raw/
 data/processed/
 *.h5
+# Any derived array dump, wherever it lands: the prep notebooks write their own
+# cache outside data/, and a 128x128 magnitude slice is still patient-derived.
+*.npz
+notebooks/prep/data/
+# Metadata reports: these carry patient_id hashes and local absolute paths.
+notebooks/prep/metadata.json
+notebooks/prep/metadata_table.txt
 
 # Generated figures / run artifacts (no images in commits — CLAUDE.md data rules)
 outputs/
