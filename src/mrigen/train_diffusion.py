@@ -8,10 +8,7 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-import jax
-import jax.numpy as jnp
-
-from mrigen.data.dataset import FastMRISlices, data_loader
+from mrigen.data import FastMRISlices
 from mrigen.models.diffusion import train_score_model
 
 

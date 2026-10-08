@@ -33,9 +33,16 @@ def save_model(path: str | Path, model: VAE) -> None:
     eqx.tree_serialise_leaves(str(path), model)
 
 
-def load_model(path: str | Path, latent_dim: int = 128) -> VAE:
-    """Load an Equinox VAE; rebuilds the skeleton then fills in saved leaves."""
-    skeleton = VAE(latent_dim=latent_dim, key=jax.random.PRNGKey(0))
+def load_model(path: str | Path, latent_dim: int = 128, model_cls=VAE) -> VAE:
+    """Load an Equinox VAE; rebuilds the skeleton then fills in saved leaves.
+
+    ``model_cls`` must match the class the checkpoint was *trained* with --
+    Equinox fills leaves into a skeleton, so a mismatched structure fails. The
+    mentor's checkpoints in CHECKPOINTS.md all use the default
+    :class:`~mrigen.models.vae.VAE`; pass ``model_cls=VAE2`` only for a
+    checkpoint you trained with it.
+    """
+    skeleton = model_cls(latent_dim=latent_dim, key=jax.random.PRNGKey(0))
     return eqx.tree_deserialise_leaves(str(path), skeleton)
 
 
@@ -84,6 +91,7 @@ def train(
     augment_data: bool = True,
     val_frac: float = 0.1,
     verbose_every: int = 10,
+    model_cls=VAE,
 ) -> VAE:
     """Train the beta-VAE prior. ``split="train"`` keeps the held-out volumes out.
 
@@ -96,7 +104,7 @@ def train(
     """
     key = jax.random.PRNGKey(seed)
     model_key, key = jax.random.split(key)
-    model = VAE(latent_dim=latent_dim, key=model_key)
+    model = model_cls(latent_dim=latent_dim, key=model_key)
 
     dataset = FastMRISlices(data_dir, split=split)
 
@@ -113,7 +121,7 @@ def train(
         flush=True,
     )
     print(
-        f"  latent_dim={latent_dim} beta={beta} sigma_x={sigma_x} "
+        f"  arch={model_cls.__name__} latent_dim={latent_dim} beta={beta} sigma_x={sigma_x} "
         f"epochs={epochs} batch={batch_size} lr={lr} augment={augment_data}",
         flush=True,
     )
@@ -189,7 +197,7 @@ def train(
             f"(PSNR {10 * np.log10(1.0 / best_val):.2f} dB) -> {out}",
             flush=True,
         )
-        model = load_model(out, latent_dim=latent_dim)
+        model = load_model(out, latent_dim=latent_dim, model_cls=model_cls)
     else:
         save_model(out, model)
         print(f"saved checkpoint -> {out}")

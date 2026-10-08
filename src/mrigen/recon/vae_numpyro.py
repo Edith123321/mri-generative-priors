@@ -45,7 +45,8 @@ def recon_model(y_obs, mask, decode, latent_dim, sigma):
 
 
 def reconstruct_map(
-    y_obs, mask, decoder, latent_dim, sigma=0.01, *, steps=1000, lr=1e-2, seed=0
+    y_obs, mask, decoder, latent_dim, sigma=0.01, *, steps=1000, lr=1e-2, seed=0,
+    progress_bar=True,
 ):
     """MAP reconstruction via SVI + AutoDelta.
 
@@ -55,7 +56,8 @@ def reconstruct_map(
     guide = autoguide.AutoDelta(recon_model)
     svi = SVI(recon_model, guide, numpyro.optim.Adam(lr), Trace_ELBO())
     result = svi.run(
-        jax.random.PRNGKey(seed), steps, y_obs, mask, decode, latent_dim, sigma
+        jax.random.PRNGKey(seed), steps, y_obs, mask, decode, latent_dim, sigma,
+        progress_bar=progress_bar,
     )
     z_map = result.params["z_auto_loc"]
     return decode(z_map), z_map
@@ -72,6 +74,7 @@ def reconstruct_posterior(
     num_warmup=200,
     seed=0,
     max_tree_depth=10,
+    progress_bar=True,
 ):
     """Posterior reconstruction via NUTS over z, with pixel-wise uncertainty.
 
@@ -84,7 +87,8 @@ def reconstruct_posterior(
     decode = make_decoder_fn(decoder)
     kernel = NUTS(recon_model, max_tree_depth=max_tree_depth)
     mcmc = MCMC(
-        kernel, num_warmup=num_warmup, num_samples=num_samples, progress_bar=True
+        kernel, num_warmup=num_warmup, num_samples=num_samples,
+        progress_bar=progress_bar,
     )
     mcmc.run(jax.random.PRNGKey(seed), y_obs, mask, decode, latent_dim, sigma)
     zs = mcmc.get_samples()["z"]

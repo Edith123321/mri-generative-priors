@@ -32,7 +32,7 @@ def acs_columns(width: int, acs_frac: float) -> np.ndarray:
 
 def _with_acs(mask: jnp.ndarray, width: int, acs_frac: float) -> jnp.ndarray:
     """Turn on the central ACS columns of a (H, W) column mask in place."""
-    n_acs = max(1, int(round(acs_frac * width)))
+    n_acs = max(1, round(acs_frac * width))
     start = (width - n_acs) // 2
     return mask.at[:, start : start + n_acs].set(1.0)
 
@@ -83,7 +83,7 @@ def random_mask(
     rng = np.random.default_rng(seed)
 
     # Target number of kept columns for the requested overall acceleration.
-    target = max(1, int(round(W / acceleration)))
+    target = max(1, round(W / acceleration))
 
     # ACS columns are always kept; they count toward the target.
     acs = acs_columns(W, acs_frac)

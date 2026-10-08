@@ -186,7 +186,12 @@ def make_decoder_fn(model):
     Accepts the full :class:`VAE` (preferred, per the contract) or a bare
     :class:`Decoder`.
     """
-    decoder = model.decoder if isinstance(model, VAE) else model
+    # Duck-typed on purpose: anything with a .decoder attribute (VAE, VAE2, a
+    # future model) hands over its decoder, and a bare Decoder is passed
+    # through. An isinstance(model, VAE) check here silently treats an
+    # alternative model as its own decoder and fails later with
+    # "object is not callable".
+    decoder = getattr(model, "decoder", model)
     params, static = eqx.partition(decoder, eqx.is_array)
 
     def decode(z: jnp.ndarray) -> jnp.ndarray:

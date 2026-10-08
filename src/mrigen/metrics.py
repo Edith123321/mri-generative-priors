@@ -1,3 +1,4 @@
+
 """Reconstruction metrics.
 
 This module is **plain NumPy** -- deliberately. JAX is for the parts of the
@@ -8,10 +9,20 @@ CPU, and feed plain floats into tables and plots. Only ``np`` is imported here.
 
 from __future__ import annotations
 
-from itertools import pairwise
+from itertools import tee
 
 import numpy as np
 from skimage.metrics import structural_similarity
+
+
+def pairwise(iterable):
+    """Return successive overlapping pairs from an iterable.
+
+    Compatible with Python 3.9, where itertools.pairwise is unavailable.
+    """
+    a, b = tee(iterable)
+    next(b, None)
+    return zip(a, b)
 
 
 def psnr(gt: np.ndarray, pred: np.ndarray, data_range: float | None = None) -> float:
@@ -105,3 +116,4 @@ def calibration_curve(
     mean_std = np.array([std[a:b].mean() for a, b in pairwise(edges) if b > a])
     mean_err = np.array([error[a:b].mean() for a, b in pairwise(edges) if b > a])
     return mean_std, mean_err
+

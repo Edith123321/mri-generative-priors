@@ -7,7 +7,6 @@ import tarfile
 import urllib.request
 from pathlib import Path
 
-
 # ============================================================
 # Configuration
 # ============================================================
@@ -30,7 +29,12 @@ def download(n: int) -> None:
     # Get FASTMRI URL from environment variable
     # --------------------------------------------------------
 
-    url =  "https://fastmri-dataset.s3.amazonaws.com/v2.0/knee_singlecoil_val.tar.xz?AWSAccessKeyId=AKIAJM2LEZ67Y2JL3KRA&Signature=IaE17GH6gzIbzh5xFHJ7s7qGKKA%3D&Expires=1796650695"
+    # Read it from the environment -- never hard-code it here. A fastMRI link is
+    # a *presigned* S3 URL: it carries an AWSAccessKeyId and a Signature, so the
+    # string itself grants dataset access to anyone holding it until it expires.
+    # The Data Sharing Agreement forbids sharing your link, and committing one
+    # publishes it to everyone who can read the repo.
+    url = os.environ.get("FASTMRI_VAL_URL")
 
     if not url:
         sys.exit(
@@ -71,85 +75,81 @@ def download(n: int) -> None:
         # Open FASTMRI URL
         # ----------------------------------------------------
 
-        with urllib.request.urlopen(url) as response:
+        # Stream (mode "r|*"): read the archive sequentially from the network
+        # and stop early -- no full download, no full decompression.
+        with (
+            urllib.request.urlopen(url) as response,  # user-supplied DSA link
+            tarfile.open(fileobj=response, mode="r|*") as tar,
+        ):
 
-            # ------------------------------------------------
-            # Open compressed TAR archive in streaming mode
-            # ------------------------------------------------
+            # --------------------------------------------
+            # Read archive one file at a time
+            # --------------------------------------------
 
-            with tarfile.open(
-                fileobj=response,
-                mode="r|*"
-            ) as tar:
+            for member in tar:
 
-                # --------------------------------------------
-                # Read archive one file at a time
-                # --------------------------------------------
+                # We only want HDF5 files
+                if not member.name.lower().endswith(".h5"):
+                    continue
 
-                for member in tar:
+                # ----------------------------------------
+                # Get only the filename
+                # ----------------------------------------
 
-                    # We only want HDF5 files
-                    if not member.name.lower().endswith(".h5"):
-                        continue
+                filename = Path(member.name).name
 
-                    # ----------------------------------------
-                    # Get only the filename
-                    # ----------------------------------------
+                # Ignore strange/empty filenames
+                if not filename:
+                    continue
 
-                    filename = Path(member.name).name
+                output_file = RAW_DIR / filename
 
-                    # Ignore strange/empty filenames
-                    if not filename:
-                        continue
+                # ----------------------------------------
+                # Check if already downloaded
+                # ----------------------------------------
 
-                    output_file = RAW_DIR / filename
+                if output_file.exists():
 
-                    # ----------------------------------------
-                    # Check if already downloaded
-                    # ----------------------------------------
+                    print(
+                        f"[{kept + 1}/{n}] "
+                        f"Already exists: {filename}"
+                    )
 
-                    if output_file.exists():
+                    kept += 1
 
-                        print(
-                            f"[{kept + 1}/{n}] "
-                            f"Already exists: {filename}"
-                        )
+                else:
 
-                        kept += 1
+                    # ------------------------------------
+                    # SECURITY:
+                    # Only extract files into RAW_DIR.
+                    #
+                    # We already flattened the filename
+                    # using Path(...).name, so archive
+                    # paths such as ../../something cannot
+                    # escape the output directory.
+                    # ------------------------------------
 
-                    else:
+                    member.name = filename
 
-                        # ------------------------------------
-                        # SECURITY:
-                        # Only extract files into RAW_DIR.
-                        #
-                        # We already flattened the filename
-                        # using Path(...).name, so archive
-                        # paths such as ../../something cannot
-                        # escape the output directory.
-                        # ------------------------------------
+                    # Compatible with older Python versions.
+                    tar.extract(
+                        member,
+                        path=RAW_DIR
+                    )
 
-                        member.name = filename
+                    kept += 1
 
-                        # Compatible with older Python versions.
-                        tar.extract(
-                            member,
-                            path=RAW_DIR
-                        )
+                    print(
+                        f"[{kept}/{n}] "
+                        f"Downloaded: {filename}"
+                    )
 
-                        kept += 1
+                # ----------------------------------------
+                # Stop after requested number
+                # ----------------------------------------
 
-                        print(
-                            f"[{kept}/{n}] "
-                            f"Downloaded: {filename}"
-                        )
-
-                    # ----------------------------------------
-                    # Stop after requested number
-                    # ----------------------------------------
-
-                    if kept >= n:
-                        break
+                if kept >= n:
+                    break
 
 
     except urllib.error.HTTPError as e:
@@ -194,7 +194,7 @@ def download(n: int) -> None:
 
         sys.exit(1)
 
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001 - top-level CLI guard
 
         print()
         print("=" * 60)
