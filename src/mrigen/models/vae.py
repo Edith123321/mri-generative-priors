@@ -1,12 +1,13 @@
 """Convolutional beta-VAE over 128x128 magnitude slices.
 
-GIVEN: the encoder/decoder architecture and the beta-VAE loss skeleton.
-
-TODO (students): the reparameterisation trick in ``reparameterise``. This is
-the one line that makes the whole thing trainable -- sampling z directly is not
+The encoder/decoder architecture is as given. ``reparameterise`` is the one
+line that makes the whole thing trainable: sampling z directly is not
 differentiable, so we sample epsilon ~ N(0, I) and form z = mu + sigma * eps so
-gradients flow through mu and sigma. The beta term is exposed as a knob (try
-0.1 .. 4.0) trading reconstruction sharpness against a smoother latent prior.
+gradients flow through mu and sigma.
+
+The weighting of the two ELBO terms is where this model lives or dies -- see
+``vae_loss`` for why both terms are sums, not means, and what ``sigma_x`` and
+``beta`` actually trade off.
 
 The decoder is a pure function of z once parameters are frozen, which is exactly
 what NumPyro needs (see recon/vae_numpyro.py).
@@ -90,27 +91,68 @@ class VAE(eqx.Module):
 def reparameterise(mu: jnp.ndarray, logvar: jnp.ndarray, key) -> jnp.ndarray:
     """Sample z ~ N(mu, sigma^2) differentiably (the reparameterisation trick).
 
-    TODO (students): return ``mu + sigma * eps`` where
-    ``sigma = exp(0.5 * logvar)`` and ``eps ~ N(0, I)`` -- draw ``eps`` with
-    ``jax.random.normal`` and ``key`` (``jax`` and ``jnp`` are imported here).
-    Sampling z directly is not differentiable; this makes it so.
+    Drawing z straight from ``N(mu, sigma^2)`` is not differentiable in mu and
+    sigma -- the randomness sits between them and the loss. Instead draw the
+    randomness from a *fixed* distribution, ``eps ~ N(0, I)``, and push it
+    through a deterministic map: ``z = mu + sigma * eps``. Now eps is just a
+    constant as far as autodiff is concerned, so gradients flow into mu and
+    sigma and the encoder is trainable.
+
+    We store ``logvar = log(sigma^2)`` rather than sigma because it is
+    unconstrained (any real number is a valid logvar, whereas sigma must stay
+    positive), so ``sigma = exp(0.5 * logvar)``.
     """
-    raise NotImplementedError("reparameterise is a TODO for students")
+    sigma = jnp.exp(0.5 * logvar)
+    eps = jax.random.normal(key, mu.shape)
+    return mu + sigma * eps
 
 
-def vae_loss(model: VAE, x: jnp.ndarray, key, beta: float = 1.0):
-    """beta-VAE negative ELBO for a single image x of shape (128, 128). GIVEN.
+def vae_loss(
+    model: VAE,
+    x: jnp.ndarray,
+    key,
+    beta: float = 1.0,
+    sigma_x: float = 0.1,
+):
+    """beta-VAE negative ELBO for a single image x of shape (128, 128).
 
-    Returns (loss, (recon_mse, kl)). Reconstruction is Gaussian (MSE);
-    KL is the closed-form KL[N(mu, sigma^2) || N(0, I)].
+    Both terms are **sums over their own axes**, and that is what makes this an
+    ELBO: a Gaussian log-density summed over the 16384 pixels, plus a KL summed
+    over the latent dimensions.
+
+    Averaging each term instead -- ``jnp.mean`` on both, which looks harmless --
+    silently reweights the KL by ``n_pixels / latent_dim`` (128x at 128^2 with
+    a 128-d latent). beta = 1 then behaves like beta = 128, the posterior
+    collapses to the prior, the KL falls to 0.0000, and z stops carrying any
+    information about x: every z decodes to the same blurry mean image, which
+    makes the "learned prior" useless for reconstruction. If you see the KL go
+    to zero in the training log, this is why.
+
+    ``sigma_x`` is the assumed per-pixel observation noise in the decoder's
+    Gaussian likelihood, and it sets the real trade-off: a small ``sigma_x``
+    trusts the pixels and gives sharp samples with a looser latent, a large one
+    trusts the prior and gives smooth samples. ``beta`` then scales the KL on
+    top of that, as in the beta-VAE paper.
+
+    Returns ``(loss, (mse, kl))``: ``mse`` is the plain per-pixel
+    reconstruction error (comparable across runs and hyperparameters) and
+    ``kl`` is the summed KL in nats.
     """
     mu, logvar = model.encoder(x)
     z = reparameterise(mu, logvar, key)
     x_hat = model.decoder(z)
-    recon = jnp.mean((x_hat - x) ** 2)
-    kl = -0.5 * jnp.mean(1.0 + logvar - mu**2 - jnp.exp(logvar))
+
+    # Reported separately from the loss so it stays interpretable: the error of
+    # one pixel, in the [0, 1] units of the image.
+    mse = jnp.mean((x_hat - x) ** 2)
+
+    # -log p(x | z) for N(x_hat, sigma_x^2 I), summed over pixels (constants dropped).
+    recon = 0.5 * jnp.sum((x_hat - x) ** 2) / sigma_x**2
+    # Closed-form KL[N(mu, sigma^2) || N(0, I)], summed over latent dims.
+    kl = -0.5 * jnp.sum(1.0 + logvar - mu**2 - jnp.exp(logvar))
+
     loss = recon + beta * kl
-    return loss, (recon, kl)
+    return loss, (mse, kl)
 
 
 def make_decoder_fn(model):
