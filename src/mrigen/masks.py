@@ -1,29 +1,17 @@
 """Cartesian undersampling masks.
 
-TODO (reconstruction thread). This is where you internalise what "accelerating the scan"
-means: a Cartesian MRI scan acquires k-space one phase-encode line (one
-column) at a time, so we accelerate by *skipping columns*. We always keep a
-fully-sampled block of central columns -- the auto-calibration signal (ACS) --
-because the low frequencies carry most of the image energy and contrast.
+A Cartesian MRI scan acquires k-space one phase-encode line (one column) at a
+time, so we accelerate by *skipping columns*. We always keep a fully-sampled
+block of central columns -- the auto-calibration signal (ACS) -- because the
+low frequencies carry most of the image energy and contrast.
 
-You must implement:
-    * ``equispaced_mask`` -- keep every R-th column plus an ACS band.
-    * ``random_mask``     -- keep a random subset of columns plus an ACS band,
-                             choosing the count so the *overall* acceleration is
-                             approximately R.
+``equispaced_mask`` keeps every R-th column plus an ACS band.
+``random_mask`` keeps a random subset of columns plus an ACS band, choosing the
+count so the *overall* acceleration is approximately R.
 
-Both return a real {0., 1.} array broadcastable over the k-space image, i.e.
-shape ``(H, W)`` where whole columns are on or off.
-
-Which library: build the mask however you like -- ``np`` and ``jnp`` are both
-imported -- but **return a JAX array** (``jnp.asarray(...)`` at the end is
-enough). Masks are built once on the host, so for randomness use plain NumPy
-(``np.random.default_rng(seed)``); ``jax.random`` is not needed and ``jax``
-itself is not imported here.
-
-Reference (give to students only if stuck): the ACS band is the central
-``acs_frac * W`` columns; the effective acceleration counts the ACS columns as
-already sampled.
+Both return a real {0., 1.} array of shape ``(H, W)`` where whole columns are
+on or off. Masks are built once on the host, so randomness uses plain NumPy;
+the return value is a JAX array.
 """
 
 from __future__ import annotations
@@ -33,13 +21,20 @@ import numpy as np
 
 
 def acs_columns(width: int, acs_frac: float) -> np.ndarray:
-    """Indices of the central ACS columns (GIVEN helper).
+    """Indices of the central ACS columns.
 
     Returns the integer column indices of the fully-sampled centre band.
     """
     n_acs = max(1, round(acs_frac * width))
     start = (width - n_acs) // 2
     return np.arange(start, start + n_acs)
+
+
+def _with_acs(mask: jnp.ndarray, width: int, acs_frac: float) -> jnp.ndarray:
+    """Turn on the central ACS columns of a (H, W) column mask in place."""
+    n_acs = max(1, int(round(acs_frac * width)))
+    start = (width - n_acs) // 2
+    return mask.at[:, start : start + n_acs].set(1.0)
 
 
 def equispaced_mask(
@@ -51,16 +46,16 @@ def equispaced_mask(
 
     Args:
         shape: (H, W) of the k-space image.
-        acceleration: R, keep roughly every R-th phase-encode column.
+        acceleration: R; keep roughly every R-th phase-encode column.
         acs_frac: fraction of columns kept fully-sampled in the centre.
 
     Returns:
         (H, W) float array of 0./1.; entire columns are on or off.
     """
-    # TODO (reconstruction thread): build a (H, W) mask that
-    #   1) turns ON every `acceleration`-th column, and
-    #   2) turns ON the central ACS columns (use `acs_columns`).
-    raise NotImplementedError("equispaced_mask is a TODO for the reconstruction thread")
+    H, W = shape
+    mask = jnp.zeros((H, W), jnp.float32)
+    mask = mask.at[:, ::acceleration].set(1.0)
+    return _with_acs(mask, W, acs_frac)
 
 
 def random_mask(
@@ -71,17 +66,37 @@ def random_mask(
 ) -> jnp.ndarray:
     """Random Cartesian mask with a central ACS band.
 
+    Keeps the central ACS columns and then draws additional columns at random
+    so that the *total* fraction of kept columns is approximately
+    ``1 / acceleration``.
+
     Args:
         shape: (H, W) of the k-space image.
         acceleration: target overall R.
         acs_frac: fraction of columns kept fully-sampled in the centre.
-        seed: RNG seed for reproducibility (feed it to ``np.random.default_rng``).
+        seed: RNG seed for reproducibility.
 
     Returns:
         (H, W) float array of 0./1.; entire columns are on or off.
     """
-    # TODO (reconstruction thread): build a (H, W) mask that
-    #   1) always keeps the central ACS columns, and
-    #   2) randomly keeps additional columns so that the *total* fraction of
-    #      kept columns is approximately 1/acceleration.
-    raise NotImplementedError("random_mask is a TODO for the reconstruction thread")
+    H, W = shape
+    rng = np.random.default_rng(seed)
+
+    # Target number of kept columns for the requested overall acceleration.
+    target = max(1, int(round(W / acceleration)))
+
+    # ACS columns are always kept; they count toward the target.
+    acs = acs_columns(W, acs_frac)
+    n_extra = max(0, target - len(acs))
+
+    # Draw the extra columns from the complement of the ACS band.
+    candidates = np.setdiff1d(np.arange(W), acs, assume_unique=True)
+    if n_extra >= len(candidates):
+        extra = candidates
+    else:
+        extra = rng.choice(candidates, size=n_extra, replace=False)
+
+    kept = np.union1d(acs, extra)
+    mask = np.zeros((H, W), dtype=np.float32)
+    mask[:, kept] = 1.0
+    return jnp.asarray(mask)

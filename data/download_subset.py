@@ -151,9 +151,6 @@ def download(n: int) -> None:
                     if kept >= n:
                         break
 
-    # ========================================================
-    # Error handling
-    # ========================================================
 
     except urllib.error.HTTPError as e:
 

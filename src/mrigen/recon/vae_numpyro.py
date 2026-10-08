@@ -1,14 +1,13 @@
 """VAE-prior reconstruction in NumPyro: MAP (SVI) and posterior (NUTS).
 
-Skeleton GIVEN; the ``recon_model`` body is the TODO (reconstruction thread). This is the
-worked example from the probabilistic-programming lecture: put a standard normal
-prior on the latent z, push it through the frozen decoder to get an image, apply
-the forward operator, and place a Gaussian likelihood on the *observed* k-space
-samples. Inference then turns measured k-space into a posterior over images.
+Put a standard normal prior on the latent z, push it through the frozen decoder
+to get an image, apply the forward operator, and place a Gaussian likelihood on
+the *observed* k-space samples. Inference then turns measured k-space into a
+posterior over images.
 
-Equinox detail (GIVEN): we ``eqx.partition`` the decoder into arrays + static
-structure and recombine inside the model, so ``decoder(z)`` is a pure function
-that JIT/NUTS can trace.
+Equinox detail: we ``eqx.partition`` the decoder into arrays + static structure
+and recombine inside the model, so ``decoder(z)`` is a pure function that
+JIT/NUTS can trace.
 """
 
 from __future__ import annotations
@@ -26,33 +25,31 @@ from mrigen.models.vae import make_decoder_fn
 def recon_model(y_obs, mask, decode, latent_dim, sigma):
     """NumPyro model: z ~ N(0, I); x = decode(z); Gaussian likelihood on k-space.
 
-    TODO (reconstruction thread): implement the four lines
+    Steps:
         1) sample ``z`` from a standard Normal of size ``latent_dim``;
         2) decode it to an image ``x``;
         3) form the forward measurement ``k = mask * fft2c(x)``;
         4) observe the real and imaginary parts of the k-space with a
-           Normal(., sigma) likelihood, restricting it to the sampled locations.
-           The mask is a *traced* array under NUTS/SVI, so boolean indexing
-           (`k.real[obs]`) raises NonConcreteBooleanIndexError -- use
-           ``dist.Normal(...).mask(obs)`` over the full array instead.
+           Normal(., sigma) likelihood, restricted to the sampled locations.
 
-    Reference (reveal if stuck):
-        z = numpyro.sample("z", dist.Normal(jnp.zeros(latent_dim), 1.0))
-        x = decode(z)
-        k = mask * fft2c(x)
-        obs = mask.astype(bool)
-        numpyro.sample("y_re", dist.Normal(k.real, sigma).mask(obs), obs=y_obs.real)
-        numpyro.sample("y_im", dist.Normal(k.imag, sigma).mask(obs), obs=y_obs.imag)
+    The mask is a *traced* array under NUTS/SVI, so boolean indexing
+    (``k.real[obs]``) raises ``NonConcreteBooleanIndexError`` -- use
+    ``dist.Normal(...).mask(obs)`` over the full array instead.
     """
-    raise NotImplementedError("recon_model body is a TODO for the reconstruction thread")
+    z = numpyro.sample("z", dist.Normal(jnp.zeros(latent_dim), 1.0))
+    x = decode(z)
+    k = mask * fft2c(x)
+    obs = mask.astype(bool)
+    numpyro.sample("y_re", dist.Normal(k.real, sigma).mask(obs), obs=y_obs.real)
+    numpyro.sample("y_im", dist.Normal(k.imag, sigma).mask(obs), obs=y_obs.imag)
 
 
 def reconstruct_map(
     y_obs, mask, decoder, latent_dim, sigma=0.01, *, steps=1000, lr=1e-2, seed=0
 ):
-    """MAP reconstruction via SVI + AutoDelta (the Wednesday deliverable). GIVEN.
+    """MAP reconstruction via SVI + AutoDelta.
 
-    Returns (image, z_map).
+    Returns ``(image, z_map)``.
     """
     decode = make_decoder_fn(decoder)
     guide = autoguide.AutoDelta(recon_model)
@@ -76,7 +73,7 @@ def reconstruct_posterior(
     seed=0,
     max_tree_depth=10,
 ):
-    """Posterior reconstruction via NUTS over z, with pixel-wise UQ. GIVEN.
+    """Posterior reconstruction via NUTS over z, with pixel-wise uncertainty.
 
     Keep ``latent_dim`` around 128-256 so the sampler mixes. Returns a dict with
     ``mean`` and ``std`` images (the std map is the uncertainty) and the raw
@@ -86,7 +83,9 @@ def reconstruct_posterior(
     """
     decode = make_decoder_fn(decoder)
     kernel = NUTS(recon_model, max_tree_depth=max_tree_depth)
-    mcmc = MCMC(kernel, num_warmup=num_warmup, num_samples=num_samples, progress_bar=True)
+    mcmc = MCMC(
+        kernel, num_warmup=num_warmup, num_samples=num_samples, progress_bar=True
+    )
     mcmc.run(jax.random.PRNGKey(seed), y_obs, mask, decode, latent_dim, sigma)
     zs = mcmc.get_samples()["z"]
     images = jax.vmap(decode)(zs)

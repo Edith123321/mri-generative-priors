@@ -1,32 +1,16 @@
 """Reconstruction metrics.
 
-Mixed given / TODO.
-
 This module is **plain NumPy** -- deliberately. JAX is for the parts of the
 codebase that must be differentiated or compiled (the decoder, the FFTs, the
 likelihood); metrics run once per reconstruction, *after* inference, on the
-CPU, and feed plain floats into tables and plots. In ``jnp`` they would ship
-every image to the accelerator and back for a subtraction and a log. This
-JAX-core-with-NumPy-around-it shape is how real JAX codebases look; deciding
-where the boundary sits is part of the skill. Only ``np`` is imported here --
-write your implementations with ``np``.
-
-TODO (evaluation thread): ``psnr`` and ``nmse`` -- two-line formulas, build confidence and
-force you to think about what "reconstruction error" means.
-
-GIVEN: ``ssim`` (delegates to scikit-image), ``diversity`` (mean pairwise SSIM
-over posterior samples -- low diversity means the prior is too confident), and
-``calibration_curve`` (bins predicted std against actual error -- a well
-calibrated uncertainty has error growing with predicted std).
+CPU, and feed plain floats into tables and plots. Only ``np`` is imported here.
 """
 
 from __future__ import annotations
 
-# from itertools import pairwise
-from typing import Any
+from itertools import pairwise
 
 import numpy as np
-from numpy import signedinteger
 from skimage.metrics import structural_similarity
 
 
@@ -34,53 +18,40 @@ def psnr(gt: np.ndarray, pred: np.ndarray, data_range: float | None = None) -> f
     """Peak signal-to-noise ratio in dB (higher is better).
 
     PSNR = 10 * log10(data_range**2 / MSE).
-
-    Plain NumPy: use ``np`` (``jnp`` is not imported in this file).
     """
+    gt = np.asarray(gt, dtype=np.float64)
+    pred = np.asarray(pred, dtype=np.float64)
 
-    # Mean squared error
     mse = np.mean((gt - pred) ** 2)
-
-    # If data_range wasn't provided, determine it from ground truth
-    if data_range is None:
-        data_range = np.max(gt) - np.min(gt)
-
-    # Perfect reconstruction
     if mse == 0:
         return float("inf")
 
-    # Avoid invalid PSNR calculation if data range is zero
+    if data_range is None:
+        data_range = float(gt.max() - gt.min())
     if data_range <= 0:
         raise ValueError("data_range must be greater than 0.")
 
-    # PSNR = 10 * log10(data_range^2 / MSE)
-    return float(10 * np.log10((data_range ** 2) / mse))
+    return float(10.0 * np.log10((data_range ** 2) / mse))
 
 
 def nmse(gt: np.ndarray, pred: np.ndarray) -> float:
     """Normalised mean squared error (lower is better).
 
     NMSE = ||pred - gt||^2 / ||gt||^2.
-
-    Plain NumPy: use ``np`` (``jnp`` is not imported in this file).
     """
+    gt = np.asarray(gt, dtype=np.float64)
+    pred = np.asarray(pred, dtype=np.float64)
 
-    # Squared error: ||pred - gt||^2
     numerator = np.sum((pred - gt) ** 2)
-
-    # Squared magnitude of ground truth: ||gt||^2
-    denominator: signedinteger[Any] = np.sum(gt ** 2)
-
-    # Avoid division by zero
+    denominator = np.sum(gt ** 2)
     if denominator == 0:
         raise ValueError("Cannot calculate NMSE because gt has zero norm.")
 
-    # NMSE = ||pred - gt||^2 / ||gt||^2
     return float(numerator / denominator)
 
 
 def ssim(gt: np.ndarray, pred: np.ndarray, data_range: float | None = None) -> float:
-    """Structural similarity index (higher is better). GIVEN."""
+    """Structural similarity index (higher is better)."""
     gt = np.asarray(gt, dtype=np.float64)
     pred = np.asarray(pred, dtype=np.float64)
     if data_range is None:
@@ -89,7 +60,7 @@ def ssim(gt: np.ndarray, pred: np.ndarray, data_range: float | None = None) -> f
 
 
 def diversity(samples: np.ndarray) -> float:
-    """Mean pairwise (1 - SSIM) over a stack of posterior image samples. GIVEN.
+    """Mean pairwise (1 - SSIM) over a stack of posterior image samples.
 
     Args:
         samples: (N, H, W) array of decoded posterior samples.
@@ -105,12 +76,16 @@ def diversity(samples: np.ndarray) -> float:
     diss = []
     for i in range(n):
         for j in range(i + 1, n):
-            diss.append(1.0 - structural_similarity(samples[i], samples[j], data_range=dr))
+            diss.append(
+                1.0 - structural_similarity(samples[i], samples[j], data_range=dr)
+            )
     return float(np.mean(diss))
 
 
-def calibration_curve(error: np.ndarray, std: np.ndarray, n_bins: int = 10) -> tuple[np.ndarray, np.ndarray]:
-    """Bin absolute error against predicted std. GIVEN.
+def calibration_curve(
+    error: np.ndarray, std: np.ndarray, n_bins: int = 10
+) -> tuple[np.ndarray, np.ndarray]:
+    """Bin absolute error against predicted std.
 
     Args:
         error: |mean - ground_truth|, any shape.
@@ -118,7 +93,7 @@ def calibration_curve(error: np.ndarray, std: np.ndarray, n_bins: int = 10) -> t
         n_bins: number of quantile bins over std.
 
     Returns:
-        (mean_std_per_bin, mean_error_per_bin); a calibrated model has these
+        ``(mean_std_per_bin, mean_error_per_bin)``; a calibrated model has these
         two arrays roughly proportional.
     """
     error = np.asarray(error).ravel()
@@ -126,6 +101,7 @@ def calibration_curve(error: np.ndarray, std: np.ndarray, n_bins: int = 10) -> t
     order = np.argsort(std)
     std, error = std[order], error[order]
     edges = np.linspace(0, len(std), n_bins + 1).astype(int)
-    # mean_std = np.array([std[a:b].mean() for a, b in pairwise(edges) if b > a])
-    # mean_err = np.array([error[a:b].mean() for a, b in pairwise(edges) if b > a])
-    # return mean_std, mean_err
+
+    mean_std = np.array([std[a:b].mean() for a, b in pairwise(edges) if b > a])
+    mean_err = np.array([error[a:b].mean() for a, b in pairwise(edges) if b > a])
+    return mean_std, mean_err
