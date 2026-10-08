@@ -45,7 +45,10 @@ class Encoder(eqx.Module):
         for conv in self.layers:
             h = jax.nn.gelu(conv(h))
         h = h.reshape(-1)
-        return self.head_mu(h), self.head_logvar(h)
+        # Bound logvar (from upstream): it goes through exp() in both the sample
+        # and the KL, and one unbounded step can overflow to inf and turn the
+        # whole run into NaN.
+        return self.head_mu(h), jnp.clip(self.head_logvar(h), -10.0, 10.0)
 
 
 class Decoder(eqx.Module):
@@ -107,6 +110,11 @@ def reparameterise(mu: jnp.ndarray, logvar: jnp.ndarray, key) -> jnp.ndarray:
     return mu + sigma * eps
 
 
+def kl_divergence(mu: jnp.ndarray, logvar: jnp.ndarray) -> jnp.ndarray:
+    """Closed-form KL[N(mu, sigma^2) || N(0, I)], **summed** over latents."""
+    return -0.5 * jnp.sum(1.0 + logvar - mu**2 - jnp.exp(logvar))
+
+
 def vae_loss(
     model: VAE,
     x: jnp.ndarray,
@@ -134,6 +142,17 @@ def vae_loss(
     trusts the prior and gives smooth samples. ``beta`` then scales the KL on
     top of that, as in the beta-VAE paper.
 
+    **Relation to the upstream parameterisation.** Upstream writes the same loss
+    with both terms divided by the pixel count and tunes ``beta`` alone. The two
+    are identical up to an overall scale, with
+
+        beta_upstream = 2 * sigma_x**2 * beta
+
+    so the default here (sigma_x=0.1, beta=1.0) is upstream's beta = 0.02, and
+    their beta sweep in CHECKPOINTS.md maps across as
+    beta 0.03 -> sigma_x 0.12, 0.3 -> 0.39, 1.0 -> 0.71. Use that to compare
+    against their reference numbers.
+
     Returns ``(loss, (mse, kl))``: ``mse`` is the plain per-pixel
     reconstruction error (comparable across runs and hyperparameters) and
     ``kl`` is the summed KL in nats.
@@ -149,7 +168,7 @@ def vae_loss(
     # -log p(x | z) for N(x_hat, sigma_x^2 I), summed over pixels (constants dropped).
     recon = 0.5 * jnp.sum((x_hat - x) ** 2) / sigma_x**2
     # Closed-form KL[N(mu, sigma^2) || N(0, I)], summed over latent dims.
-    kl = -0.5 * jnp.sum(1.0 + logvar - mu**2 - jnp.exp(logvar))
+    kl = kl_divergence(mu, logvar)
 
     loss = recon + beta * kl
     return loss, (mse, kl)

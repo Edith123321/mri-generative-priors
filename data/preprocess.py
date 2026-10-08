@@ -52,52 +52,70 @@ def _to_slices(esc: np.ndarray, size: int) -> np.ndarray:
     return out
 
 
-def preprocess(size: int = 128) -> None:
-    vols = sorted(RAW_DIR.glob("*.h5"))
+def preprocess_volume(vol: Path, out_dir: Path, size: int = 128) -> int:
+    """Write ``out_dir/<vol stem>.npz`` from one ``.h5`` volume; return its slice count.
+
+    Returns 0 (and writes nothing) if the volume has no ``reconstruction_esc``,
+    e.g. the fastMRI *test* set, which ships only undersampled k-space.
+    """
+    try:
+        with h5py.File(vol, "r") as f:
+            if SOURCE_KEY not in f:
+                print(f"skip {vol.name}: no '{SOURCE_KEY}' dataset")
+                return 0
+            esc = f[SOURCE_KEY][()]  # (n_slices, 320, 320) float32 magnitude
+    except OSError as exc:
+        # A truncated download is the usual cause: the fastMRI links are
+        # time-limited, so a stream that dies part-way leaves a file that looks
+        # fine in `ls` and cannot be opened. Skip it rather than losing the
+        # whole run -- but the caller reports it, because a silently missing
+        # volume is a silently smaller training set, and that shows up later
+        # as a worse prior.
+        print(f"skip {vol.name}: cannot read ({exc.__class__.__name__}) -- "
+              f"likely a truncated download; re-download this volume")
+        return -1
+    slices = _to_slices(esc, size)
+    # write-then-rename, so an interrupted run never leaves a truncated shard
+    tmp = out_dir / f".{vol.stem}.npz.tmp"
+    with open(tmp, "wb") as fh:
+        np.savez_compressed(fh, slices=slices)
+    tmp.replace(out_dir / f"{vol.stem}.npz")
+    return slices.shape[0]
+
+
+def preprocess(size: int = 128, raw_dir: Path = RAW_DIR, out_dir: Path = OUT_DIR) -> None:
+    vols = sorted(raw_dir.glob("*.h5"))
     if not vols:
         raise SystemExit(
-            f"No .h5 files in {RAW_DIR}. Run `python data/download_subset.py` first."
+            f"No .h5 files in {raw_dir}. Run `python data/download_subset.py` first."
         )
-    OUT_DIR.mkdir(parents=True, exist_ok=True)
+    out_dir.mkdir(parents=True, exist_ok=True)
 
-    skipped = []
+    unreadable = []
     for vol in vols:
-        try:
-            with h5py.File(vol, "r") as f:
-                if SOURCE_KEY not in f:
-                    print(f"skip {vol.name}: no '{SOURCE_KEY}' dataset")
-                    skipped.append((vol.name, f"no '{SOURCE_KEY}' dataset"))
-                    continue
-                esc = f[SOURCE_KEY][()]  # (n_slices, 320, 320) float32 magnitude
-        except OSError as exc:
-            # A truncated download is the usual cause: the fastMRI links are
-            # time-limited, so a stream that dies part-way leaves a file that
-            # looks fine in `ls` but cannot be opened. Skip it and keep going
-            # rather than losing the whole run -- but do say so at the end,
-            # because a silently missing volume is a silently smaller training
-            # set, and that shows up later as a worse prior.
-            print(f"skip {vol.name}: cannot read ({exc.__class__.__name__}) -- "
-                  f"likely a truncated download; re-download this volume")
-            skipped.append((vol.name, "unreadable/truncated"))
-            continue
-        slices = _to_slices(esc, size)
-        out = OUT_DIR / f"{vol.stem}.npz"
-        np.savez_compressed(out, slices=slices)
-        print(f"{vol.name}: {slices.shape[0]} slices -> {out}")
+        n = preprocess_volume(vol, out_dir, size)
+        if n == -1:
+            unreadable.append(vol.name)
+        elif n:
+            print(f"{vol.name}: {n} slices -> {out_dir / (vol.stem + '.npz')}")
 
-    shards = sorted(OUT_DIR.glob("*.npz"))
+    shards = sorted(out_dir.glob("*.npz"))
     total = sum(np.load(p)["slices"].shape[0] for p in shards)
-    print(f"done: {total} slices from {len(shards)} volume(s) in {OUT_DIR}")
-    if skipped:
-        print(f"WARNING: skipped {len(skipped)} of {len(vols)} raw volume(s):")
-        for name, why in skipped:
-            print(f"  - {name}: {why}")
+    print(f"done: {total} slices from {len(shards)} volume(s) in {out_dir}")
+    if unreadable:
+        print(f"WARNING: {len(unreadable)} of {len(vols)} raw volume(s) could not "
+              f"be read and were skipped; re-download them:")
+        for name in unreadable:
+            print(f"  - {name}")
 
 
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--size", type=int, default=128)
-    preprocess(p.parse_args().size)
+    p.add_argument("--raw", type=Path, default=RAW_DIR, help="directory of .h5 volumes")
+    p.add_argument("--out", type=Path, default=OUT_DIR, help="where to write .npz shards")
+    args = p.parse_args()
+    preprocess(args.size, args.raw, args.out)
 
 
 if __name__ == "__main__":

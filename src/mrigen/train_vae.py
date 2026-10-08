@@ -206,7 +206,8 @@ def main():
     p.add_argument("--no-augment", action="store_true")
     p.add_argument("--out", default="checkpoints/vae_128.eqx")
     p.add_argument(
-        "--split", default="train", help="'train' (default), 'test', or 'all'"
+        "--split", default="train",
+        help="'train' (default), 'val', 'test', or 'all'",
     )
     args = p.parse_args()
     train(
