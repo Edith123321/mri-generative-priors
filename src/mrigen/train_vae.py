@@ -119,14 +119,19 @@ def train(
     )
 
     steps_per_epoch = max(1, len(train_imgs) // batch_size)
+    total_steps = max(2, epochs * steps_per_epoch)
     # Warm up then cosine-decay: the first epochs of a VAE are unstable because
     # the encoder and decoder are chasing each other, and decaying at the end
-    # buys a visibly sharper decoder.
+    # buys a visibly sharper decoder. optax wants decay_steps to be the *total*
+    # schedule length, so the warm-up has to stay well inside it -- cap it at a
+    # tenth of the run, or a 3-epoch smoke test asks for 30 warm-up steps out of
+    # 18 and optax raises on a negative decay length.
+    warmup_steps = max(1, min(5 * steps_per_epoch, total_steps // 10))
     schedule = optax.warmup_cosine_decay_schedule(
         init_value=lr / 10,
         peak_value=lr,
-        warmup_steps=5 * steps_per_epoch,
-        decay_steps=epochs * steps_per_epoch,
+        warmup_steps=warmup_steps,
+        decay_steps=total_steps,
         end_value=lr / 50,
     )
     # Clipping matters here: the summed reconstruction term makes early
